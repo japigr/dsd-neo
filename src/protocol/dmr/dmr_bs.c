@@ -477,6 +477,44 @@ process_dmr_bs_three_voice_frames(dsd_opts* opts, dsd_state* state, uint8_t inte
     process_dmr_bs_voice_frame(opts, state, internalslot, ambe_fr3, 2);
 }
 
+/*
+ * Align the DMR RC4 voice keystream drop offset to the current superframe
+ * position (voice-channel burst number VC1..VC6).
+ *
+ * The RC4 keystream for an encrypted DMR voice superframe is one continuous
+ * stream RC4(key || MI); each 49-bit AMBE frame consumes 7 keystream bytes
+ * after an initial 256-byte discard, so voice frame f (f = 0..17, three per
+ * burst) decrypts at drop 256 + f*7. On a cold call acquisition the decoder
+ * frequently locks mid-superframe (first decoded burst is VCn, n > 1); the
+ * frames of VC1..VC(n-1) are never processed, so state->dropL is never
+ * advanced for them and stays at the reset value 256 while the transmitter is
+ * already at 256 + (n-1)*3*7. Those first frames then decrypt with a
+ * misaligned keystream and render as warble even though the over-the-air FEC
+ * is clean (err = [0][0]).
+ *
+ * Re-derive the offset from the authoritative VC counter before decrypting
+ * each burst. For a call tracked from VC1 this exactly matches the
+ * free-running value (no behaviour change); for a mid-superframe join it
+ * corrects the offset so VCn..VC6 of the first partial superframe decrypt
+ * cleanly instead of being lost.
+ */
+static void
+align_dmr_bs_rc4_drop_to_vc(dsd_state* state, const dmr_bs_ctx* ctx, uint8_t vc) {
+    if (vc < 1 || vc > 6) {
+        return;
+    }
+    const int drop = 256 + (((int)vc - 1) * 3 * 7);
+    if (ctx->internalslot == 0) {
+        if (state->payload_algid == 0x21) {
+            state->dropL = drop;
+        }
+    } else {
+        if (state->payload_algidR == 0x21) {
+            state->dropR = drop;
+        }
+    }
+}
+
 static void
 write_dmr_bs_dsp_output(const dsd_opts* opts, const dsd_state* state, uint8_t internalslot) {
     FILE* pFile = dsd_fopen_private(opts->dsp_out_file, "a");
@@ -572,6 +610,7 @@ process_dmr_bs_voice_burst(dsd_opts* opts, dsd_state* state, dmr_bs_ctx* ctx) {
     copy_dmr_bs_voice_frames(ctx->m1, ctx->m2, ctx->m3, ctx->ambe_fr, ctx->ambe_fr2, ctx->ambe_fr3);
     apply_dmr_bs_voice_keystream(state, ctx->ambe_fr, ctx->ambe_fr2, ctx->ambe_fr3);
 
+    align_dmr_bs_rc4_drop_to_vc(state, ctx, vc);
     process_dmr_bs_three_voice_frames(opts, state, ctx->internalslot, ctx->ambe_fr, ctx->ambe_fr2, ctx->ambe_fr3);
 
     if (opts->use_dsp_output == 1) {
