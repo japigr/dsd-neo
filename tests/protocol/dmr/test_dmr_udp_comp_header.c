@@ -423,6 +423,73 @@ main(void) {
                                 "t10 both truncated destination");
     }
 
+    // T12: ARS. On a manufacturer-specific index (95-127) the port is not named, so an ARS frame is
+    // recognised by content; on an extended-header port 4005 it is recognised by port. Either way the
+    // slot string is rewritten rather than appended to, the summary reaches the notice, and the
+    // notice is control traffic. Content that does not frame as ARS, or a Reserved index, is not.
+    {
+        // A Device Registration Ack (size 2, header BF, refresh 1 = 30 min) on a manufacturer-specific
+        // index (100), SAID 1 (Ethernet) to DAID 0 (Radio Network).
+        const uint8_t live[] = {0x00U, 0x00U, 0x10U, 0x64U, 0x64U, 0x00U, 0x02U, 0xBFU, 0x01U};
+        DSD_SNPRINTF(st.dmr_lrrp_gps[0], sizeof st.dmr_lrrp_gps[0], "%s", "STALE text from an earlier PDU; ");
+        run_case(&opts, &st, live, sizeof live);
+        rc |= expect_count(g_datacall_calls, 1U, "t12 vendor single notice");
+        rc |= expect_has_substr(g_datacall_text, "SRC: 1:100 (Ethernet):(Manufacturer Specific);", "t12 vendor src");
+        rc |=
+            expect_has_substr(g_datacall_text, "DST: 0:100 (Radio Network):(Manufacturer Specific);", "t12 vendor dst");
+        rc |= expect_has_substr(g_datacall_text, "ARS Ack: OK; refresh 30 min;", "t12 vendor ars in notice");
+        rc |= expect_str_eq(st.dmr_lrrp_gps[0], "ARS SRC: 1234; DST: 5678; ARS Ack: OK; refresh 30 min; ",
+                            "t12 vendor slot string");
+        rc |= expect_category(g_datacall_category, DSD_EVENT_CATEGORY_CONTROL, "t12 vendor category");
+        rc |= expect_count(g_lip_calls, 0U, "t12 vendor no LIP");
+
+        // Same index, bytes that do not frame as ARS: a size prefix larger than the payload, and a
+        // record whose first header lacks the Priority/Cntl bits every ARS message carries.
+        const uint8_t oversize[] = {0x00U, 0x01U, 0x10U, 0x64U, 0x64U, 0xD8U, 0x1AU, 0x93U, 0xBFU};
+        run_case(&opts, &st, oversize, sizeof oversize);
+        rc |= expect_no_substr(g_datacall_text, "ARS", "t12 oversize not ars");
+        rc |= expect_category(g_datacall_category, DSD_EVENT_CATEGORY_DATA, "t12 oversize category");
+        const uint8_t no_cntl[] = {0x00U, 0x02U, 0x10U, 0x64U, 0x64U, 0x00U, 0x02U, 0x0FU, 0x01U};
+        run_case(&opts, &st, no_cntl, sizeof no_cntl);
+        rc |= expect_no_substr(g_datacall_text, "ARS", "t12 no pri/cntl not ars");
+        rc |= expect_category(g_datacall_category, DSD_EVENT_CATEGORY_DATA, "t12 no pri/cntl category");
+
+        // A Reserved index (63) carrying the same ARS bytes is left alone: only the vendor range is
+        // open to recognition by content.
+        const uint8_t reserved[] = {0x00U, 0x03U, 0x10U, 0x3FU, 0x3FU, 0x00U, 0x02U, 0xBFU, 0x01U};
+        run_case(&opts, &st, reserved, sizeof reserved);
+        rc |= expect_no_substr(g_datacall_text, "ARS", "t12 reserved index not ars");
+        rc |= expect_category(g_datacall_category, DSD_EVENT_CATEGORY_DATA, "t12 reserved category");
+
+        // Nothing documents which vendor index carries ARS, so the whole Manufacturer Specific range
+        // is open to it: both ends of 95-127 are recognised, and 94, the last Reserved index, is not.
+        static const struct {
+            uint8_t idx;
+            int ars;
+        } edges[] = {{94U, 0}, {95U, 1}, {127U, 1}};
+
+        for (size_t i = 0; i < sizeof(edges) / sizeof(edges[0]); i++) {
+            const uint8_t pdu[] = {0x00U, 0x05U, 0x10U, edges[i].idx, edges[i].idx, 0x00U, 0x02U, 0xBFU, 0x01U};
+            run_case(&opts, &st, pdu, sizeof pdu);
+            if (edges[i].ars) {
+                rc |= expect_has_substr(g_datacall_text, "ARS Ack: OK; refresh 30 min;", "t12 vendor range edge ars");
+                rc |=
+                    expect_category(g_datacall_category, DSD_EVENT_CATEGORY_CONTROL, "t12 vendor range edge category");
+            } else {
+                rc |= expect_no_substr(g_datacall_text, "ARS", "t12 reserved edge not ars");
+                rc |= expect_category(g_datacall_category, DSD_EVENT_CATEGORY_DATA, "t12 reserved edge category");
+            }
+        }
+
+        // Extended-header destination port 4005 (table 7.20) names ARS outright.
+        const uint8_t port4005[] = {0x00U, 0x04U, 0x01U, 0x3FU, 0x00U, 0x0FU, 0xA5U, 0x00U, 0x02U, 0xBFU, 0x01U};
+        run_case(&opts, &st, port4005, sizeof port4005);
+        rc |= expect_has_substr(g_datacall_text, "DST: 1:0 (Ethernet):(In Extended Header, UDP 4005);",
+                                "t12 port 4005 dst");
+        rc |= expect_has_substr(g_datacall_text, "ARS Ack: OK; refresh 30 min;", "t12 port 4005 ars in notice");
+        rc |= expect_category(g_datacall_category, DSD_EVENT_CATEGORY_CONTROL, "t12 port 4005 category");
+    }
+
     free(st.event_history_s);
     st.event_history_s = NULL;
 
