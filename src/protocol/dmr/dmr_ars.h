@@ -21,6 +21,10 @@ extern "C" {
 
 void dmr_ars_print_message(dsd_state* state, const uint8_t* msg, uint16_t len);
 
+// Nonzero when `msg` frames as an ARS message to the letter of the spec. Use it to recognise ARS on a
+// port that does not name it, such as a manufacturer-specific compressed UDP/IP index.
+int dmr_ars_is_plausible(const uint8_t* msg, uint16_t len);
+
 #ifdef __cplusplus
 }
 #endif

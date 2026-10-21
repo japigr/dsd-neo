@@ -328,13 +328,21 @@ dmr_udp_event_category(uint16_t src_port, uint16_t dst_port) {
                : DSD_EVENT_CATEGORY_DATA;
 }
 
-enum { DMR_UDP_COMP_PORT_TEXT = 5016U, DMR_UDP_COMP_PORT_LIP = 5017U };
+enum { DMR_UDP_COMP_PORT_TEXT = 5016U, DMR_UDP_COMP_PORT_LIP = 5017U, DMR_UDP_COMP_PORT_ARS = 4005U };
 
 typedef enum {
     DMR_UDP_COMP_SERVICE_NONE,
     DMR_UDP_COMP_SERVICE_TEXT,
     DMR_UDP_COMP_SERVICE_LIP,
+    DMR_UDP_COMP_SERVICE_ARS,
 } dmr_udp_comp_service_type;
+
+// What dmr_udp_comp_decode_payload() decoded, so the notice can be built to match.
+typedef enum {
+    DMR_UDP_COMP_DECODED_NONE,
+    DMR_UDP_COMP_DECODED_GPS,
+    DMR_UDP_COMP_DECODED_ARS,
+} dmr_udp_comp_decoded;
 
 static dmr_udp_comp_service_type
 dmr_udp_comp_service(uint16_t src_port, uint16_t dst_port) {
@@ -345,7 +353,21 @@ dmr_udp_comp_service(uint16_t src_port, uint16_t dst_port) {
     if (src_port == DMR_UDP_COMP_PORT_LIP || dst_port == DMR_UDP_COMP_PORT_LIP) {
         return DMR_UDP_COMP_SERVICE_LIP;
     }
+    // The radio's ARS port is fixed at 4005 (MOTOTRBO ARS spec). Tables 7.17/7.18 give it no default
+    // index, so it resolves here only from an extended header; a radio configured to carry it on a
+    // manufacturer-specific index is recognised from the payload in dmr_udp_comp_decode_payload().
+    if (src_port == DMR_UDP_COMP_PORT_ARS || dst_port == DMR_UDP_COMP_PORT_ARS) {
+        return DMR_UDP_COMP_SERVICE_ARS;
+    }
     return DMR_UDP_COMP_SERVICE_NONE;
+}
+
+// Tables 7.17/7.18: 1011111-1111111 (95-127) is Manufacturer Specific, a port the radio is
+// configured with and the header does not name. Such a port never resolves (see
+// dmr_udp_comp_port_init), so its service can only be recognised from the payload itself.
+static int
+dmr_udp_comp_idx_is_vendor(uint16_t idx) {
+    return idx >= 95U;
 }
 
 // One SPID or DPID: the 7-bit index as sent and the UDP port it stands for. They never share a
@@ -408,17 +430,25 @@ dmr_udp_comp_port_desc(const dmr_udp_comp_port* entry, char* out, size_t out_siz
     }
 }
 
-static int DSD_ATTR_USED
-dmr_udp_comp_decode_payload(const dsd_opts* opts, dsd_state* state, uint16_t src_port, uint16_t dst_port, uint16_t len,
-                            uint16_t ptr, const uint8_t* pdu) {
+static dmr_udp_comp_decoded DSD_ATTR_USED
+dmr_udp_comp_decode_payload(const dsd_opts* opts, dsd_state* state, uint16_t src_port, uint16_t dst_port,
+                            uint8_t vendor_port, uint16_t len, uint16_t ptr, const uint8_t* pdu) {
     if (len <= ptr) {
-        return 0;
+        return DMR_UDP_COMP_DECODED_NONE;
     }
     len -= ptr;
-    const dmr_udp_comp_service_type service = dmr_udp_comp_service(src_port, dst_port);
+    dmr_udp_comp_service_type service = dmr_udp_comp_service(src_port, dst_port);
+    // A manufacturer-specific port has no number to dispatch on, so ARS carried on one can only be
+    // recognised by content. ARS is self-delimiting, and dmr_ars_is_plausible() is stricter than the
+    // decoder, so other vendor traffic stays on the notice below. Motorola is known to send ARS this
+    // way (a Device Registration Ack), and no document ties it to a particular index, so recognition
+    // spans the whole manufacturer-specific range.
+    if (service == DMR_UDP_COMP_SERVICE_NONE && vendor_port != 0U && dmr_ars_is_plausible(pdu + ptr, len)) {
+        service = DMR_UDP_COMP_SERVICE_ARS;
+    }
     if (service == DMR_UDP_COMP_SERVICE_TEXT) {
         utf16_to_text(state, 1, len, pdu + ptr); //assumming text starts right at the ptr value
-        return 0;
+        return DMR_UDP_COMP_DECODED_NONE;
     }
     if (service == DMR_UDP_COMP_SERVICE_LIP) {
         uint8_t bits[127 * 8];
@@ -434,13 +464,23 @@ dmr_udp_comp_decode_payload(const dsd_opts* opts, dsd_state* state, uint16_t src
         state->dmr_embedded_gps[slot][0] = '\0';
         lip_pdu_decoder(opts, state, bits, (size_t)decode_len * 8U, (uint32_t)state->dmr_lrrp_source[slot]);
         if (state->dmr_embedded_gps[slot][0] != '\0') {
-            return 1;
+            return DMR_UDP_COMP_DECODED_GPS;
         }
         DSD_SNPRINTF(state->dmr_embedded_gps[slot], sizeof(state->dmr_embedded_gps[slot]), "%s", previous_gps);
-        return 0;
+        return DMR_UDP_COMP_DECODED_NONE;
+    }
+    if (service == DMR_UDP_COMP_SERVICE_ARS) {
+        // As on the uncompressed path: the slot string is rewritten with the radios and the decoder
+        // appends its summary, so no text from an earlier PDU is carried into this one.
+        uint8_t slot = (state->currentslot == 1) ? 1U : 0U;
+        DSD_FPRINTF(stderr, "ARS;");
+        DSD_SNPRINTF(state->dmr_lrrp_gps[slot], sizeof(state->dmr_lrrp_gps[slot]), "ARS SRC: %llu; DST: %llu; ",
+                     state->dmr_lrrp_source[slot], state->dmr_lrrp_target[slot]);
+        dmr_ars_print_message(state, pdu + ptr, len);
+        return DMR_UDP_COMP_DECODED_ARS;
     }
     DSD_FPRINTF(stderr, "Unknown Decode Format;");
-    return 0;
+    return DMR_UDP_COMP_DECODED_NONE;
 }
 
 void
@@ -496,18 +536,27 @@ dmr_udp_comp_pdu(dsd_opts* opts, dsd_state* state, uint16_t len, const uint8_t* 
 
     const uint16_t src_port = src.known ? src.port : 0U;
     const uint16_t dst_port = dst.known ? dst.port : 0U;
-    const int has_gps = dmr_udp_comp_decode_payload(opts, state, src_port, dst_port, len, ptr, DMR_PDU);
+    const uint8_t vendor_port = (uint8_t)(dmr_udp_comp_idx_is_vendor(src.idx) || dmr_udp_comp_idx_is_vendor(dst.idx));
+    const dmr_udp_comp_decoded decoded =
+        dmr_udp_comp_decode_payload(opts, state, src_port, dst_port, vendor_port, len, ptr, DMR_PDU);
 
     char comp_string[500];
     DSD_MEMSET(comp_string, 0, sizeof(comp_string));
     DSD_SNPRINTF(comp_string, sizeof(comp_string), "IP ID: %04X; OP: %d; SRC: %d:%d (%s):(%s); DST: %d:%d (%s):(%s); ",
                  ipid, opcode, said, src.idx, src_idx_desc, src_port_desc, daid, dst.idx, dst_idx_desc, dst_port_desc);
+    // The ARS decoder leaves its summary in the slot string; carry it into the notice so the decoded
+    // result reaches the history row, as on the MNIS and uncompressed ARS paths.
+    if (decoded == DMR_UDP_COMP_DECODED_ARS) {
+        dsd_append(comp_string, sizeof(comp_string), state->dmr_lrrp_gps[slot]);
+    }
     // The radios on this PDU are the data header's LLIDs, as for every other DMR data notice;
     // SAID/DAID are 4-bit network indices (tables 7.15/7.16), not radio IDs.
     const dsd_call_observation observation = dsd_call_observation_data(
         state->lastsynctype, slot, (uint64_t)state->dmr_lrrp_source[slot], (uint64_t)state->dmr_lrrp_target[slot]);
-    const dsd_event_category category = dmr_udp_event_category(src_port, dst_port);
-    if (has_gps) {
+    // ARS is control traffic however it was identified: by port 4005 or by content on a vendor index.
+    const dsd_event_category category =
+        (decoded == DMR_UDP_COMP_DECODED_ARS) ? DSD_EVENT_CATEGORY_CONTROL : dmr_udp_event_category(src_port, dst_port);
+    if (decoded == DMR_UDP_COMP_DECODED_GPS) {
         (void)dsd_event_emit_data_notice_classified_with_gps(opts, state, slot, &observation, category, comp_string,
                                                              state->dmr_embedded_gps[slot]);
     } else {

@@ -34,6 +34,8 @@
 
 #define DMR_ARS_HDR_EXT         0x80U
 #define DMR_ARS_HDR_ACK         0x40U
+// Priority (bit 5) and Cntl (bit 4): set in the first header of every ARS message (spec 3.4).
+#define DMR_ARS_HDR_PRI_CNTL    0x30U
 
 // Second header of a registration: the Event field, bits 6-5.
 #define DMR_ARS_HDR2_EVENT      0x60U
@@ -226,6 +228,39 @@ dmr_ars_format(const uint8_t* rec, uint16_t rec_len, char* out, size_t out_sz) {
         case DMR_ARS_TYPE_USER_ACK: dmr_ars_format_ack(rec, rec_len, 1U, out, out_sz); break;
         case DMR_ARS_TYPE_REG_ACK: dmr_ars_format_ack(rec, rec_len, 0U, out, out_sz); break;
         default: break;
+    }
+}
+
+// Recognising ARS on a port that does not name it has to reject what is not ARS, so unlike
+// dmr_ars_format(), which reads a record at face value, this holds the frame to the spec: the size
+// prefix bounds a non-empty record inside the received octets, a set Ext bit is backed by a second
+// header octet, Priority and Cntl are both set (as in every message of spec 3.4), and the PDU type
+// is one the spec defines.
+int
+dmr_ars_is_plausible(const uint8_t* msg, uint16_t len) {
+    if (msg == NULL || len < 3U) {
+        return 0;
+    }
+    const uint16_t rec_len = (uint16_t)(((uint16_t)msg[0] << 8) | msg[1]);
+    if (rec_len == 0U || rec_len > (uint16_t)(len - 2U)) {
+        return 0;
+    }
+    const uint8_t hdr = msg[2];
+    if ((hdr & DMR_ARS_HDR_PRI_CNTL) != DMR_ARS_HDR_PRI_CNTL) {
+        return 0;
+    }
+    if ((hdr & DMR_ARS_HDR_EXT) != 0U && rec_len < 2U) {
+        return 0;
+    }
+    switch (hdr & 0x0FU) {
+        case DMR_ARS_TYPE_DEV_REG:
+        case DMR_ARS_TYPE_DEV_DEREG:
+        case DMR_ARS_TYPE_QUERY:
+        case DMR_ARS_TYPE_USER_REG:
+        case DMR_ARS_TYPE_USER_DEREG:
+        case DMR_ARS_TYPE_USER_ACK:
+        case DMR_ARS_TYPE_REG_ACK: return 1;
+        default: return 0;
     }
 }
 
